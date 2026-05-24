@@ -64,6 +64,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
           path: src
           fetch-depth: 0
+          submodules: recursive
 
       - name: Confirm checked-out commit matches tag
         working-directory: src
