@@ -1,0 +1,224 @@
+name: release
+
+# Heavy build workflow. Triggered by `repository_dispatch` from
+# klyx-terminal/klyx (the private source repo) on every `v*` tag.
+# Clones the source via a read-only PAT, builds + signs + notarizes
+# Klyx.app for Apple Silicon, publishes the zip as a Release on THIS
+# repo (so the cask URL stays anonymously downloadable), and updates
+# Casks/klyx.rb in-tree.
+#
+# Required repository secrets:
+#   KLYX_SOURCE_CLONE_TOKEN  Fine-grained PAT with `Contents: read` on
+#                            klyx-terminal/klyx. Used to clone the
+#                            private source at the dispatched tag.
+#   APPLE_DEVELOPER_ID_CERT_P12_BASE64
+#   APPLE_DEVELOPER_ID_CERT_PASSWORD
+#   APPLE_DEVELOPER_ID_IDENTITY
+#   APPLE_ID
+#   APPLE_TEAM_ID
+#   APPLE_APP_SPECIFIC_PASSWORD
+#       All six required for Developer ID sign + notarize. If any are
+#       missing the build falls back to ad-hoc signing (Gatekeeper
+#       warning on first launch).
+
+on:
+  repository_dispatch:
+    types: [klyx-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to (re)build, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.client_payload.tag || github.event.inputs.tag }}
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha256: ${{ steps.meta.outputs.sha256 }}
+      asset: ${{ steps.meta.outputs.asset }}
+    steps:
+      - name: Validate dispatched tag
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_TAG:-}" ]]; then
+            echo "No tag in dispatch payload or workflow input." >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Tag must look like v0.1.0; got '$RELEASE_TAG'." >&2
+            exit 1
+          fi
+
+      - name: Checkout private klyx source at tag
+        uses: actions/checkout@v6
+        with:
+          repository: klyx-terminal/klyx
+          token: ${{ secrets.KLYX_SOURCE_CLONE_TOKEN }}
+          ref: ${{ env.RELEASE_TAG }}
+          path: src
+          fetch-depth: 0
+
+      - name: Confirm checked-out commit matches tag
+        working-directory: src
+        run: |
+          set -euo pipefail
+          TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+            echo "Checked out commit does not match $RELEASE_TAG." >&2
+            echo "tag:  $TAG_COMMIT" >&2
+            echo "head: $HEAD_COMMIT" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - name: Stamp .tag for klyx-version build script
+        working-directory: src
+        run: echo -n "$RELEASE_TAG" > .tag
+
+      - name: Build (release)
+        working-directory: src
+        run: cargo build --release -p klyx
+
+      - name: Assemble Klyx.app
+        working-directory: src
+        run: |
+          set -euo pipefail
+          APP="dist/Klyx.app"
+          mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+          cp target/release/klyx "${APP}/Contents/MacOS/klyx"
+          cp assets/macos/Klyx.app/Contents/Info.plist "${APP}/Contents/Info.plist"
+          cp assets/macos/Klyx.app/Contents/Resources/klyx.icns "${APP}/Contents/Resources/klyx.icns"
+
+      - name: Sign and notarize Klyx.app
+        working-directory: src
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP="dist/Klyx.app"
+          if [[ -z "${APPLE_DEVELOPER_ID_CERT_P12_BASE64:-}" \
+             || -z "${APPLE_DEVELOPER_ID_CERT_PASSWORD:-}" \
+             || -z "${APPLE_DEVELOPER_ID_IDENTITY:-}" \
+             || -z "${APPLE_ID:-}" \
+             || -z "${APPLE_TEAM_ID:-}" \
+             || -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+            echo "::warning::Apple signing secrets not set — ad-hoc signing only (see docs/codesigning.md)."
+            scripts/macos/sign.sh "${APP}"
+            exit 0
+          fi
+          KEYCHAIN_PATH="${RUNNER_TEMP}/klyx-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          P12_PATH="${RUNNER_TEMP}/cert.p12"
+          echo "${APPLE_DEVELOPER_ID_CERT_P12_BASE64}" | base64 --decode > "${P12_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${P12_PATH}" \
+            -P "${APPLE_DEVELOPER_ID_CERT_PASSWORD}" \
+            -A -t cert -f pkcs12 \
+            -k "${KEYCHAIN_PATH}"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "${KEYCHAIN_PASSWORD}" \
+            "${KEYCHAIN_PATH}" >/dev/null
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" \
+            $(security list-keychains -d user | sed 's/"//g')
+          KLYX_SIGNING_IDENTITY="${APPLE_DEVELOPER_ID_IDENTITY}" \
+            scripts/macos/sign.sh "${APP}"
+          scripts/macos/notarize.sh "${APP}"
+          security delete-keychain "${KEYCHAIN_PATH}" || true
+          rm -f "${P12_PATH}"
+
+      - name: Package final zip
+        id: meta
+        working-directory: src
+        run: |
+          set -euo pipefail
+          OUT="Klyx-${RELEASE_TAG}-arm64"
+          (cd dist && zip -ry "../${OUT}.zip" "Klyx.app")
+          SHA=$(shasum -a 256 "${OUT}.zip" | awk '{print $1}')
+          shasum -a 256 "${OUT}.zip" > "${OUT}.zip.sha256"
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "asset=${OUT}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub Release (on this tap repo)
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: false
+          files: |
+            src/${{ steps.meta.outputs.asset }}
+            src/${{ steps.meta.outputs.asset }}.sha256
+
+  publish-cask:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap (this repo)
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Checkout klyx source for cask template
+        # Use main, not the tag, so cask-template fixes propagate to
+        # re-runs of older tags. The template is just formatting
+        # (URL/homepage/depends_on); placeholders @TAG@/@VERSION@/@SHA256@
+        # are substituted from the build outputs.
+        uses: actions/checkout@v6
+        with:
+          repository: klyx-terminal/klyx
+          token: ${{ secrets.KLYX_SOURCE_CLONE_TOKEN }}
+          ref: main
+          path: src
+
+      - name: Render Casks/klyx.rb from template
+        env:
+          TAG: ${{ needs.build-macos.outputs.tag }}
+          SHA256: ${{ needs.build-macos.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          mkdir -p Casks
+          sed -e "s/@TAG@/${TAG}/g" \
+              -e "s/@VERSION@/${VERSION}/g" \
+              -e "s/@SHA256@/${SHA256}/g" \
+              src/homebrew/klyx.rb > Casks/klyx.rb
+
+      - name: Commit and push
+        env:
+          TAG: ${{ needs.build-macos.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "klyx-terminal"
+          git config user.email "klyx-terminal@users.noreply.github.com"
+          if git diff --quiet -- Casks/klyx.rb; then
+            echo "Cask already up to date."
+            exit 0
+          fi
+          git add Casks/klyx.rb
+          git commit -m "klyx ${TAG}"
+          git push
