@@ -1,8 +1,8 @@
 cask "klyx" do
-  version "0.1.45"
-  sha256 "49aa6984c92b2e78023745932e7ade9b36f6a6990220d74fe7f47e897cb8e087"
+  version "0.1.42"
+  sha256 "917fcadde52f0c4f309ffcb3e10e9545de4553c0f8097e0eb78b6a48b3adb2a4"
 
-  url "https://github.com/klyx-terminal/homebrew-klyx/releases/download/v0.1.45/Klyx-v0.1.45-arm64.zip"
+  url "https://github.com/klyx-terminal/homebrew-klyx/releases/download/v0.1.42/Klyx-v0.1.42-arm64.zip"
   name "Klyx"
   desc "Minimal, opinionated terminal emulator"
   homepage "https://github.com/klyx-terminal/homebrew-klyx"
